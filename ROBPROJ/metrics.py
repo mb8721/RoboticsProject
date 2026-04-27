@@ -22,7 +22,7 @@ from metrics import MetricsLogger
 
 logger = MetricsLogger(vx_cmd=0.2, trial_duration=10.0)
 
-# In control loop:
+# In your control loop:
 logger.update(vx, vz, roll, pitch, body_height)
 
 # At end of trial:
@@ -42,14 +42,17 @@ from typing import Optional
 class MetricsLogger:
     """Tracks stability cost J and survival rate S across trials."""
 
-    # ---- Reward weights (tune to emphasize what matters) ----
+    # Reward weights (tune to emphasize what matters
     W_VX    = 2.0    # forward velocity tracking
     W_VZ    = 1.0    # vertical velocity (bouncing)
     W_ROLL  = 1.5    # roll stability
     W_PITCH = 1.5    # pitch stability
 
-    # ---- Fall detection thresholds ----
-    FALL_HEIGHT_M       = 0.10            # body height (m) below which = fallen
+    # Fall detection thresholds
+    # NOTE: Lowered from 0.10 -> 0.08 because the proprioceptive height
+    # estimate naturally dips ~2cm during swing phases (one foot up = lower
+    # mean foot z). 0.08 m still catches actual falls (real fall is ~0 m).
+    FALL_HEIGHT_M       = 0.08            # body height (m) below which = fallen
     FALL_ROLL_RAD       = np.radians(45)  # roll angle beyond which = fallen
     FALL_GRACE_S        = 1.5             # ignore falls during first N seconds
     FALL_SUSTAIN_S      = 0.30            # require N seconds of sustained "fallen" before declaring
@@ -78,10 +81,6 @@ class MetricsLogger:
         self._height_samples: list = []
 
         self.trial_results: list = []   # list of dicts
-
-    # ------------------------------------------------------------------
-    # Trial management
-    # ------------------------------------------------------------------
 
     def start_trial(self):
         """Call at the beginning of each new trial."""
@@ -120,7 +119,7 @@ class MetricsLogger:
         self._pitch_samples.append(pitch)
         self._height_samples.append(body_height)
 
-        # ---- Fall detection (with grace period + sustained-state debounce) ----
+        # fall detection (with grace period + sustained-state debounce) ----
         looks_fallen = (body_height < self.FALL_HEIGHT_M or
                         abs(roll) > self.FALL_ROLL_RAD)
 
@@ -142,7 +141,7 @@ class MetricsLogger:
             # reset the sustained timer
             self._fallen_since = None
 
-        # ---- Instantaneous cost ----
+        
         cost = (self.W_VX    * (vx - self.vx_cmd) ** 2 +
                 self.W_VZ    * vz ** 2 +
                 self.W_ROLL  * roll ** 2 +
@@ -190,7 +189,7 @@ class MetricsLogger:
                   f"{h_m.min():.3f}m / {h_m.max():.3f}m")
         return result
 
-    
+  
     def survival_rate(self) -> float:
         """S = fraction of completed trials that survived."""
         if not self.trial_results:
