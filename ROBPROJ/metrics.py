@@ -1,5 +1,8 @@
 """
+metrics.py
+==========
 Performance metrics for the fault-tolerant locomotion project.
+
 Tracks:
   J  – composite stability cost (lower = better)
   S  – survival rate across M trials (higher = better)
@@ -14,18 +17,18 @@ Fall criteria (from proposal §III):
   body height < 0.10 m   OR   |roll| > 45°
 
 Usage
-
+-----
 from metrics import MetricsLogger
 
 logger = MetricsLogger(vx_cmd=0.2, trial_duration=10.0)
 
-# in the loop
+# In control loop:
 logger.update(vx, vz, roll, pitch, body_height)
 
-# at end of trial:
+# At end of trial:
 result = logger.end_trial()
 
-# after M trials:
+# After M trials:
 print(logger.summary())
 logger.save_csv("results_FR.csv")
 """
@@ -37,25 +40,28 @@ from typing import Optional
 
 
 class MetricsLogger:
-    """Tracks stability cost J and survival rate S across trials"""
+    """Tracks stability cost J and survival rate S across trials."""
 
-    # reward weights (tune to emphasize what matters) 
+    # ---- Reward weights (tune to emphasize what matters) ----
     W_VX    = 2.0    # forward velocity tracking
     W_VZ    = 1.0    # vertical velocity (bouncing)
     W_ROLL  = 1.5    # roll stability
     W_PITCH = 1.5    # pitch stability
 
-    # fall detection thresholds 
-    FALL_HEIGHT_M   = 0.10  # body height (m) below which = fallen
-    FALL_ROLL_RAD   = np.radians(45)  # roll angle beyond which = fallen
+    # ---- Fall detection thresholds ----
+    FALL_HEIGHT_M       = 0.10            # body height (m) below which = fallen
+    FALL_ROLL_RAD       = np.radians(45)  # roll angle beyond which = fallen
+    FALL_GRACE_S        = 1.5             # ignore falls during first N seconds
+    FALL_SUSTAIN_S      = 0.30            # require N seconds of sustained "fallen" before declaring
 
     def __init__(self, vx_cmd: float = 0.2, trial_duration: float = 10.0):
         """
         Parameters
+        ----------
         vx_cmd : float
-            Commanded forward velocity (m/s) used in cost calculation
+            Commanded forward velocity (m/s) used in cost calculation.
         trial_duration : float
-            Required survival time (s) to count as a successful trial
+            Required survival time (s) to count as a successful trial.
         """
         self.vx_cmd         = vx_cmd
         self.trial_duration = trial_duration
@@ -63,46 +69,80 @@ class MetricsLogger:
         self._costs: list   = []
         self._fell: bool    = False
         self._fall_time: Optional[float] = None
+        self._fallen_since: Optional[float] = None  # debounce timer
         self._start_time    = None
+
+        # Telemetry for diagnostics (post-trial summary of state ranges)
+        self._roll_samples: list = []
+        self._pitch_samples: list = []
+        self._height_samples: list = []
 
         self.trial_results: list = []   # list of dicts
 
-        # trial 
+    # ------------------------------------------------------------------
+    # Trial management
+    # ------------------------------------------------------------------
 
     def start_trial(self):
-        """Call at the beginning of each new trial"""
-        self._costs  = []
-        self._fell  = False
+        """Call at the beginning of each new trial."""
+        self._costs     = []
+        self._fell      = False
         self._fall_time = None
+        self._fallen_since = None
         self._start_time = time.time()
+        self._roll_samples   = []
+        self._pitch_samples  = []
+        self._height_samples = []
 
     def update(self,
                vx: float, vz: float,
                roll: float, pitch: float,
                body_height: float):
         """
-        1. Record one timestep 
-        2. Call every control cycle
+        Record one timestep.  Call every control cycle.
 
         Parameters
+        ----------
         vx          : forward velocity (m/s)
         vz          : vertical velocity (m/s)
         roll        : body roll angle (rad)
         pitch       : body pitch angle (rad)
         body_height : body CoM height above ground (m)
         """
-
         if self._fell:
             return   # trial already failed; stop accumulating
 
-        # fall det
-        if body_height < self.FALL_HEIGHT_M or abs(roll) > self.FALL_ROLL_RAD:
-            self._fell = True
-            self._fall_time = time.time() - (self._start_time or time.time())
-            print(f"[Metrics] *** FALL DETECTED at t={self._fall_time:.2f}s ***")
-            return
+        now = time.time()
+        elapsed = now - (self._start_time or now)
 
-        # cost (inst)
+        # Telemetry (always recorded, even during grace)
+        self._roll_samples.append(roll)
+        self._pitch_samples.append(pitch)
+        self._height_samples.append(body_height)
+
+        # ---- Fall detection (with grace period + sustained-state debounce) ----
+        looks_fallen = (body_height < self.FALL_HEIGHT_M or
+                        abs(roll) > self.FALL_ROLL_RAD)
+
+        if elapsed < self.FALL_GRACE_S:
+            # Inside grace window — never declare a fall
+            self._fallen_since = None
+        elif looks_fallen:
+            # Start (or continue) the sustained-fallen timer
+            if self._fallen_since is None:
+                self._fallen_since = now
+            elif (now - self._fallen_since) >= self.FALL_SUSTAIN_S:
+                self._fell = True
+                self._fall_time = elapsed
+                print(f"[Metrics] *** FALL DETECTED at t={self._fall_time:.2f}s "
+                      f"(roll={np.degrees(roll):+.1f}°, "
+                      f"height={body_height:.3f}m) ***")
+                return
+        else:
+            # reset the sustained timer
+            self._fallen_since = None
+
+        # ---- Instantaneous cost ----
         cost = (self.W_VX    * (vx - self.vx_cmd) ** 2 +
                 self.W_VZ    * vz ** 2 +
                 self.W_ROLL  * roll ** 2 +
@@ -136,8 +176,21 @@ class MetricsLogger:
         status = "SURVIVED ✓" if survived else ("FELL ✗" if self._fell else "TIMEOUT ✗")
         print(f"[Metrics] Trial {len(self.trial_results)} ended  |  "
               f"J={J:.4f}  |  {status}  |  {duration:.1f}s")
+
+        # Telemetry: range of roll, pitch, body_height during trial
+        if self._roll_samples:
+            r_deg = np.degrees(self._roll_samples)
+            p_deg = np.degrees(self._pitch_samples)
+            h_m   = np.array(self._height_samples)
+            print(f"[Telemetry]  roll  min/max/|max| = "
+                  f"{r_deg.min():+6.1f}° / {r_deg.max():+6.1f}° / {np.abs(r_deg).max():5.1f}°")
+            print(f"[Telemetry]  pitch min/max/|max| = "
+                  f"{p_deg.min():+6.1f}° / {p_deg.max():+6.1f}° / {np.abs(p_deg).max():5.1f}°")
+            print(f"[Telemetry]  height min/max      = "
+                  f"{h_m.min():.3f}m / {h_m.max():.3f}m")
         return result
 
+    
     def survival_rate(self) -> float:
         """S = fraction of completed trials that survived."""
         if not self.trial_results:
@@ -145,7 +198,7 @@ class MetricsLogger:
         return sum(1 for r in self.trial_results if r["survived"]) / len(self.trial_results)
 
     def mean_J(self) -> float:
-        """mean stability cost across completed trials."""
+        """Mean stability cost across completed trials."""
         vals = [r["J"] for r in self.trial_results if r["J"] != float("inf")]
         return float(np.mean(vals)) if vals else float("inf")
 
