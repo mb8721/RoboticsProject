@@ -1,7 +1,11 @@
 """
+run_experiment.py
+=================
 Experiment runner for the fault-tolerant three-legged locomotion project.
 
-Lab 3 architecture:
+Bridges ThreeLegGaitController <-> Mendbayar's Lab 3 ROS 2 stack.
+
+Lab 3 architecture (lab_3.py):
   - SUBSCRIBES /joint_states                          (sensor_msgs/JointState)
   - PUBLISHES  /forward_command_controller/commands   (std_msgs/Float64MultiArray)
   - Per-leg FK + per-leg IK (scipy.optimize, L-BFGS-B)
@@ -13,7 +17,7 @@ This file:
     loop stays a simple synchronous 50 Hz loop.
   - Optionally subscribes to /imu/data and /odom for state feedback.  If
     neither is available we estimate body_height proprioceptively and
-    leave roll/pitch = 0  (a warning at start).
+    leave roll/pitch = 0  (you'll get a warning at startup).
 
 Three conditions (per proposal sec.IV):
   (a) baseline_4leg  - normal 4-leg trot, no fault
@@ -31,9 +35,9 @@ python3 run_experiment.py --mode real --disable-leg FR
 python3 run_experiment.py --mode real --all-conditions
 
 Run order:
-  1. Launch Lab 3 / Pupper bringup as you normally do.
-  2. STOP lab_3 inverse_kinematics node (this script replaces it).
-  3. Run script.
+  1. Launch your Lab 3 / Pupper bringup as you normally do.
+  2. STOP your lab_3 inverse_kinematics node (this script replaces it).
+  3. Run this script.
 """
 
 import argparse
@@ -44,12 +48,14 @@ from typing import Optional
 import numpy as np
 import scipy.optimize
 
-from three_leg_gait import ThreeLegGaitController, FR, FL, HR, HL, LEG_NAMES
+from three_leg_gait import (ThreeLegGaitController, FR, FL, HR, HL,
+                            LEG_NAMES, DEFAULT_FOOT_POS)
 from metrics import MetricsLogger
 
 LEG_MAP = {"FR": FR, "FL": FL, "HR": HR, "HL": HL, "NONE": None}
 DT = 0.02   # 50 Hz control rate
 
+# Joint name order - must match lab_3.py listener_callback exactly
 JOINT_NAMES = [
     "leg_front_r_1", "leg_front_r_2", "leg_front_r_3",
     "leg_front_l_1", "leg_front_l_2", "leg_front_l_3",
@@ -57,7 +63,6 @@ JOINT_NAMES = [
     "leg_back_l_1",  "leg_back_l_2",  "leg_back_l_3",
 ]
 
-# FK from lab 3
 
 def _rx(a):  return np.array([[1,0,0,0],[0,np.cos(a),-np.sin(a),0],[0,np.sin(a),np.cos(a),0],[0,0,0,1]])
 def _ry(a):  return np.array([[np.cos(a),0,np.sin(a),0],[0,1,0,0],[-np.sin(a),0,np.cos(a),0],[0,0,0,1]])
@@ -92,12 +97,13 @@ def bl_leg_fk(theta):   # = HL (hind left)
     T3e = _tr(0.06231, -0.06216, -0.01800)
     return (T01 @ T12 @ T23 @ T3e)[:3, 3]
 
-# order: FR, FL, HR(BR), HL(BL) ( matches three_leg_gait.py leg indices
+# Order: FR, FL, HR(BR), HL(BL) - matches three_leg_gait.py leg indices
 FK_FUNCS = [fr_leg_fk, fl_leg_fk, br_leg_fk, bl_leg_fk]
 
 
 def _ik_single_leg(target_ee, leg_index, x0):
-
+    """Per-leg IK using the same formulation as lab_3.py.
+    Warm-started from x0 to keep online IK fast."""
     fk = FK_FUNCS[leg_index]
     target = np.asarray(target_ee, dtype=float)
     res = scipy.optimize.minimize(
@@ -105,10 +111,11 @@ def _ik_single_leg(target_ee, leg_index, x0):
         x0=np.asarray(x0, dtype=float),
         method="L-BFGS-B",
         bounds=[(-np.pi, np.pi)] * 3,
-        # lower maxiter than lab 3 cache (500)-> converges fast
+        # Lower maxiter than Lab 3 cache (500) - warm-start converges fast
         options={"ftol": 1e-9, "gtol": 1e-7, "maxiter": 60},
     )
     return res.x
+
 
 def _import_ros2():
     """Lazy import so smoke mode works without ROS 2 installed."""
@@ -130,26 +137,30 @@ def _make_bridge_class():
         def __init__(self):
             super().__init__("three_leg_gait_bridge")
 
-            # state caches (filled by callbacks)
+            # State caches (filled by callbacks)
             self._joint_positions: Optional[np.ndarray] = None
             self._imu_rpy: Optional[np.ndarray] = None
             self._odom_vx: Optional[float] = None
             self._odom_vz: Optional[float] = None
             self._odom_z:  Optional[float] = None
 
-            # guesses for IK no1
+            # Warm-start joint guesses for IK
             self._ik_warm = np.zeros((4, 3))
             self._last_cmd_vx = 0.0
-            
-            self.create_subscription(JointState, "joint_states", # Subscriptions
+
+            # Subscriptions
+            self.create_subscription(JointState, "joint_states",
                                      self._on_joint_state, 10)
-            for topic in ("imu/data", "imu", "imu_plugin/out", "imu/data_raw"):
+            for topic in ("imu/data", "imu", "imu_plugin/out", "imu/data_raw",
+                          "imu_sensor_broadcaster/imu",
+                          "imu_sensor_broadcaster/imu_data",
+                          "imu_sensor_node/imu"):
                 self.create_subscription(Imu, topic, self._on_imu, 10)
             if Odometry is not None:
                 for topic in ("odom", "pupper/odom"):
                     self.create_subscription(Odometry, topic, self._on_odom, 10)
 
-            # publisher
+            # Publisher
             self._cmd_pub = self.create_publisher(
                 Float64MultiArray,
                 "/forward_command_controller/commands",
@@ -158,7 +169,7 @@ def _make_bridge_class():
 
             self.get_logger().info("Lab3Bridge ready.")
 
-        # callbacks
+        # ---- Callbacks ----
         def _on_joint_state(self, msg):
             try:
                 idxs = [msg.name.index(n) for n in JOINT_NAMES]
@@ -184,7 +195,7 @@ def _make_bridge_class():
             self._odom_vz = float(msg.twist.twist.linear.z)
             self._odom_z  = float(msg.pose.pose.position.z)
 
-        # api used 
+        # ---- API used by run_experiment ----
         def wait_for_joint_state(self, timeout=5.0):
             t0 = time.time()
             while self._joint_positions is None:
@@ -235,6 +246,37 @@ def _make_bridge_class():
             msg.data = [0.0] * 12
             self._cmd_pub.publish(msg)
 
+        def settle_to_stance(self, duration=2.0, dt=0.02):
+            """Smoothly move from current joint pose to default trot stance.
+            Prevents the robot from lurching when the trial starts."""
+            if self._joint_positions is None:
+                print("[Robot] Cannot settle: no joint state received yet.")
+                return
+
+            # IK target = default stance, also seeds warm-start for trial loop
+            target = np.zeros(12)
+            warm = np.zeros((4, 3))
+            for i in range(4):
+                theta = _ik_single_leg(DEFAULT_FOOT_POS[i], i, warm[i])
+                warm[i] = theta
+                target[3*i:3*i+3] = theta
+            self._ik_warm = warm
+
+            initial = self._joint_positions.copy()
+            n_steps = max(1, int(duration / dt))
+            print(f"[Robot] Settling to stance over {duration:.1f}s "
+                  "(prevents lurch at trial start)...")
+            for k in range(n_steps):
+                alpha = (k + 1) / n_steps
+                # cosine ease-in-out
+                s = 0.5 - 0.5 * np.cos(np.pi * alpha)
+                cmd = (1.0 - s) * initial + s * target
+                msg = Float64MultiArray()
+                msg.data = cmd.tolist()
+                self._cmd_pub.publish(msg)
+                time.sleep(dt)
+            print("[Robot] Settle complete.")
+
         def has_imu(self):  return self._imu_rpy is not None
         def has_odom(self): return self._odom_vx is not None
 
@@ -242,6 +284,7 @@ def _make_bridge_class():
 
 
 _BRIDGE_STATE = {"node": None, "executor": None, "thread": None, "rclpy": None}
+
 
 def robot_init(mode="real"):
     if mode == "smoke":
@@ -312,8 +355,6 @@ def robot_stop(robot):
         rclpy.shutdown()
     _BRIDGE_STATE.update(node=None, executor=None, thread=None, rclpy=None)
 
-
-#trial 
 def run_trial(mode, disabled_leg_name, velocity=0.20,
               trial_duration=10.0, disable_at_t=3.0):
     disabled_leg = LEG_MAP[disabled_leg_name.upper()]
@@ -331,6 +372,11 @@ def run_trial(mode, disabled_leg_name, velocity=0.20,
     ctrl    = ThreeLegGaitController(dt=DT)
     metrics = MetricsLogger(vx_cmd=velocity, trial_duration=trial_duration)
     robot   = robot_init(mode=mode) if mode in ("sim", "real") else None
+
+    # Smoothly stand up before starting the trial — prevents the lurch from
+    # post-homing folded pose into trot stance.
+    if robot is not None:
+        robot.settle_to_stance(duration=2.0, dt=DT)
 
     metrics.start_trial()
     t = 0.0
@@ -424,9 +470,8 @@ def _save_summary_csv(results, path="experiment_summary.csv"):
     print(f"[Results] Summary saved -> {path}")
 
 
-# ===========================================================================
 # CLI
-# ===========================================================================
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
