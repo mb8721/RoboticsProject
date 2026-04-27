@@ -1,5 +1,6 @@
 """
-
+three_leg_gait.py
+=================
 Fault-tolerant three-legged gait controller for Pupper (ROB-UY-2004).
 
 Extends the Lab 3 trot controller with:
@@ -12,9 +13,9 @@ Extends the Lab 3 trot controller with:
 Inspired by: Feng et al., Control Engineering Practice, vol. 165, 2025
 
 Integration:
-  Replace (or wrap) Lab 3 foot-position computation with
+  Replace (or wrap) your Lab 3 foot-position computation with
   ThreeLegGaitController.step().  The output is a (4,3) numpy array
-  of foot positions in the body frame, ready for  IK function.
+  of foot positions in the body frame, ready for your IK function.
 
 Coordinate convention (matches Stanford/NYU Pupper):
   x  = forward
@@ -27,15 +28,20 @@ Leg indices:
 
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Leg index constants
+# ---------------------------------------------------------------------------
 FR, FL, HR, HL = 0, 1, 2, 3
 LEG_NAMES = {FR: "FR", FL: "FL", HR: "HR", HL: "HL"}
 
+# ---------------------------------------------------------------------------
 # Default foot positions in the body frame (meters).
+# These match the leg offsets in Mendbayar's Lab 3 (lab_3.py):
 #   rf_ee_offset = [ 0.06, -0.09, 0]    +  z_stance = -0.14
 #   lf_ee_offset = [ 0.06,  0.09, 0]    +  z_stance = -0.14
 #   rb_ee_offset = [-0.11, -0.09, 0]    +  z_stance = -0.14
 #   lb_ee_offset = [-0.11,  0.09, 0]    +  z_stance = -0.14
-
+# ---------------------------------------------------------------------------
 DEFAULT_FOOT_POS = np.array([
     [ 0.06, -0.09, -0.14],   # FR (rf in Lab 3)
     [ 0.06,  0.09, -0.14],   # FL (lf in Lab 3)
@@ -43,6 +49,7 @@ DEFAULT_FOOT_POS = np.array([
     [-0.11,  0.09, -0.14],   # HL (lb in Lab 3)
 ], dtype=float)
 
+# ---------------------------------------------------------------------------
 # Pre-computed CoM compensation shifts (meters, XY plane).
 #
 # When leg i is lifted the support polygon becomes a triangle of the
@@ -60,7 +67,7 @@ DEFAULT_FOOT_POS = np.array([
 #   Lift FL: centroid(FR,HR,HL) = (-0.0267, -0.0217)
 #   Lift HR: centroid(FR,FL,HL) = (+0.0267, +0.0217)
 #   Lift HL: centroid(FR,FL,HR) = (+0.0267, -0.0217)
-
+# ---------------------------------------------------------------------------
 _FOOT_XY = DEFAULT_FOOT_POS[:, :2]
 _COM_SHIFT_GAIN = 0.70   # fraction of full centroid shift to apply (tune 0.5-0.8)
 
@@ -69,13 +76,16 @@ def _precompute_com_shifts():
     for leg in [FR, FL, HR, HL]:
         support = [i for i in range(4) if i != leg]
         centroid = np.mean(_FOOT_XY[support], axis=0)
-        # shift support feet toward centroid so body CoM is above triangle
+        # Shift support feet toward centroid so body CoM is above triangle
         shifts[leg] = centroid * _COM_SHIFT_GAIN
     return shifts
 
 COM_SHIFTS = _precompute_com_shifts()
 
 
+# ---------------------------------------------------------------------------
+# Main controller
+# ---------------------------------------------------------------------------
 class ThreeLegGaitController:
     """
     Drop-in replacement for the Lab 3 trot controller with fault-tolerance.
@@ -94,15 +104,17 @@ class ThreeLegGaitController:
     foot_pos = ctrl.step(velocity=0.2)
     """
 
-    # Gait parameters 
-    SWING_HEIGHT    = 0.05   # m max foot lift during swing
-    STEP_LENGTH     = 0.05   # m max step forward per cycle
-    SWING_FRACTION  = 0.35   # fraction of cycle spent in swing
-    CYCLE_HZ        = 1.2    # gait cycles per second
+    # ---- Gait parameters (stable static walk: one leg at a time) ----
+    # We use a static walk (not a trot) because the Pupper has no active
+    # balance control — three feet must always be on the ground.
+    SWING_HEIGHT    = 0.05   # m - foot lift during swing
+    STEP_LENGTH     = 0.05   # m - default stride length
+    SWING_FRACTION  = 0.25   # only one leg in swing at a time (4 * 0.25 = 1.0)
+    CYCLE_HZ        = 1.0    # gait cycles per second
 
-    # fault-transition parameters (from Feng et al. §3.3) 
-    LIFT_HEIGHT   = 0.10   # m  how high to hold the disabled foot
-    LIFT_DURATION = 3.0    # s  ramp time (avoids inertial shock)
+    # ---- Fault-transition parameters (from Feng et al. §3.3) ----
+    LIFT_HEIGHT   = 0.10   # m – how high to hold the disabled foot
+    LIFT_DURATION = 3.0    # s – ramp time (avoids inertial shock)
 
     def __init__(self, dt: float = 0.02,
                  default_foot_pos: np.ndarray = None):
@@ -121,17 +133,19 @@ class ThreeLegGaitController:
             else np.array(default_foot_pos, dtype=float)
         )
 
+        # ---- State ----
         self.disabled_leg     = None   # None = four-leg trot
         self.transition_t     = 0.0
         self.is_transitioning = False
 
         # Gait phases in [0,1) for each leg.
-        # Four-leg trot: diagonal pairs share phase.
-        #   FR(0) + HL(3) swing together  phase 0.0
-        #   FL(1) + HR(2) swing together  phase 0.5
-        self.phases = np.array([0.0, 0.5, 0.5, 0.0], dtype=float)
+        # Static walk: one leg in swing at a time, evenly spaced.
+        # Order: FR -> HL -> FL -> HR  (alternating front/back, left/right)
+        #   FR(0): phase 0.00   FL(1): phase 0.50
+        #   HR(2): phase 0.75   HL(3): phase 0.25
+        self.phases = np.array([0.0, 0.5, 0.75, 0.25], dtype=float)
 
-        # Foot positions at swing start (updated each stance  to swing transition)
+        # Foot positions at swing start (updated each stance→swing transition)
         self._swing_start = self.default_foot_pos.copy()
         self._in_swing    = np.zeros(4, dtype=bool)
 
@@ -141,6 +155,9 @@ class ThreeLegGaitController:
         # Dynamic step length (set per call to step() based on velocity)
         self._step_length = self.STEP_LENGTH
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def disable_leg(self, leg_idx: int):
         """
@@ -180,27 +197,31 @@ class ThreeLegGaitController:
         foot_pos : ndarray (4,3)
             [x, y, z] for each leg in body frame (FR, FL, HR, HL).
         """
-        #update transition timer 
+        # ---- Update transition timer ----
         if self.is_transitioning:
             self.transition_t += self.dt
             if self.transition_t >= self.LIFT_DURATION:
                 self.is_transitioning = False
                 print(f"[ThreeLeg] Transition complete.  Running 3-leg walk.")
 
-        # phase advance 
+        # ---- Phase advance ----
         moving  = velocity > 0.01
         d_phase = (self.CYCLE_HZ * self.dt) if moving else 0.0
 
-        # velocity = step_length * cycle_hz  ->  step_length = velocity / cycle_hz
+        # ---- Step length scales with velocity ----
+        # Capped tightly so IK targets stay within Pupper leg reach.
+        # Max 0.07m chosen to keep front-leg sweep within +0.06 +/- 0.035 m
+        # which is reachable. Larger values cause IK to fail and the robot
+        # to assume weird postures and tip over.
         if moving:
-            self._step_length = float(np.clip(velocity / self.CYCLE_HZ, 0.03, 0.08))
+            self._step_length = float(np.clip(velocity / self.CYCLE_HZ, 0.04, 0.07))
         else:
             self._step_length = self.STEP_LENGTH
 
-        # coM shift for 3-leg mode 
+        # ---- CoM shift for 3-leg mode ----
         com_xy = COM_SHIFTS[self.disabled_leg] if self.disabled_leg is not None else np.zeros(2)
 
-        #  Compute foot targets 
+        # ---- Compute foot targets ----
         foot_cmd = np.zeros((4, 3))
 
         for leg in range(4):
@@ -208,12 +229,12 @@ class ThreeLegGaitController:
                 foot_cmd[leg] = self._disabled_pos(leg)
                 continue
 
-            # Detect stance to swing transition (for updating swing_start)
+            # Detect stance→swing transition (for updating swing_start)
             prev_phase = self.phases[leg]
             self.phases[leg] = (self.phases[leg] + d_phase) % 1.0
             cur_phase = self.phases[leg]
 
-            # Crossed 0 to entering new swing
+            # Crossed 0 → entering new swing
             if prev_phase > self.SWING_FRACTION and cur_phase <= self.SWING_FRACTION:
                 # Capture position at end of stance as swing start
                 self._swing_start[leg] = foot_cmd[leg] if np.any(foot_cmd[leg]) else \
@@ -222,10 +243,10 @@ class ThreeLegGaitController:
             p = self.phases[leg]
 
             if p < self.SWING_FRACTION:
-                t = p / self.SWING_FRACTION              # 0 to 1 within swing
+                t = p / self.SWING_FRACTION              # 0→1 within swing
                 foot_cmd[leg] = self._swing_pos(leg, t)
             else:
-                t = (p - self.SWING_FRACTION) / (1.0 - self.SWING_FRACTION)  # 0 to 1within stance
+                t = (p - self.SWING_FRACTION) / (1.0 - self.SWING_FRACTION)  # 0→1 within stance
                 foot_cmd[leg] = self._stance_pos(leg, t)
 
             # Apply CoM compensation to support legs
@@ -240,7 +261,10 @@ class ThreeLegGaitController:
         """Current mode: 'four_leg' or 'three_leg'."""
         return "three_leg" if self.disabled_leg is not None else "four_leg"
 
-  
+    # ------------------------------------------------------------------
+    # Trajectory helpers
+    # ------------------------------------------------------------------
+
     def _swing_pos(self, leg: int, t: float) -> np.ndarray:
         """
         Swing trajectory using cycloid-like x and half-cosine z lift.
@@ -272,7 +296,7 @@ class ThreeLegGaitController:
         t : float in [0,1]  (0 = start of stance, 1 = end)
         """
         d = self.default_foot_pos[leg]
-        x = d[0] + self._step_length * (0.5 - t)   # +L/2 to  -L/2
+        x = d[0] + self._step_length * (0.5 - t)   # +L/2 -> -L/2
         return np.array([x, d[1], d[2]])
 
     def _disabled_pos(self, leg: int) -> np.ndarray:
@@ -285,5 +309,5 @@ class ThreeLegGaitController:
             ramp = min(self.transition_t / self.LIFT_DURATION, 1.0)
         else:
             ramp = 1.0
-        pos[2] += ramp * self.LIFT_HEIGHT   # z is negativeto  lifts foot
+        pos[2] += ramp * self.LIFT_HEIGHT   # z is negative → += lifts foot
         return pos
