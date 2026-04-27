@@ -1,0 +1,180 @@
+"""
+Performance metrics for the fault-tolerant locomotion project.
+Tracks:
+  J  – composite stability cost (lower = better)
+  S  – survival rate across M trials (higher = better)
+
+J formula (matches proposal §III):
+  J = (1/N) * Σ_t [ w1*(vx−v̄x)² + w2*roll² + w3*pitch² + w4*vz² ]
+
+S formula:
+  S = (# trials walking ≥ T seconds without falling) / M
+
+Fall criteria (from proposal §III):
+  body height < 0.10 m   OR   |roll| > 45°
+
+Usage
+
+from metrics import MetricsLogger
+
+logger = MetricsLogger(vx_cmd=0.2, trial_duration=10.0)
+
+# in the loop
+logger.update(vx, vz, roll, pitch, body_height)
+
+# at end of trial:
+result = logger.end_trial()
+
+# after M trials:
+print(logger.summary())
+logger.save_csv("results_FR.csv")
+"""
+
+import csv
+import time
+import numpy as np
+from typing import Optional
+
+
+class MetricsLogger:
+    """Tracks stability cost J and survival rate S across trials"""
+
+    # reward weights (tune to emphasize what matters) 
+    W_VX    = 2.0    # forward velocity tracking
+    W_VZ    = 1.0    # vertical velocity (bouncing)
+    W_ROLL  = 1.5    # roll stability
+    W_PITCH = 1.5    # pitch stability
+
+    # fall detection thresholds 
+    FALL_HEIGHT_M   = 0.10  # body height (m) below which = fallen
+    FALL_ROLL_RAD   = np.radians(45)  # roll angle beyond which = fallen
+
+    def __init__(self, vx_cmd: float = 0.2, trial_duration: float = 10.0):
+        """
+        Parameters
+        vx_cmd : float
+            Commanded forward velocity (m/s) used in cost calculation
+        trial_duration : float
+            Required survival time (s) to count as a successful trial
+        """
+        self.vx_cmd         = vx_cmd
+        self.trial_duration = trial_duration
+
+        self._costs: list   = []
+        self._fell: bool    = False
+        self._fall_time: Optional[float] = None
+        self._start_time    = None
+
+        self.trial_results: list = []   # list of dicts
+
+        # trial 
+
+    def start_trial(self):
+        """Call at the beginning of each new trial"""
+        self._costs  = []
+        self._fell  = False
+        self._fall_time = None
+        self._start_time = time.time()
+
+    def update(self,
+               vx: float, vz: float,
+               roll: float, pitch: float,
+               body_height: float):
+        """
+        1. Record one timestep 
+        2. Call every control cycle
+
+        Parameters
+        vx          : forward velocity (m/s)
+        vz          : vertical velocity (m/s)
+        roll        : body roll angle (rad)
+        pitch       : body pitch angle (rad)
+        body_height : body CoM height above ground (m)
+        """
+
+        if self._fell:
+            return   # trial already failed; stop accumulating
+
+        # fall det
+        if body_height < self.FALL_HEIGHT_M or abs(roll) > self.FALL_ROLL_RAD:
+            self._fell = True
+            self._fall_time = time.time() - (self._start_time or time.time())
+            print(f"[Metrics] *** FALL DETECTED at t={self._fall_time:.2f}s ***")
+            return
+
+        # cost (inst)
+        cost = (self.W_VX    * (vx - self.vx_cmd) ** 2 +
+                self.W_VZ    * vz ** 2 +
+                self.W_ROLL  * roll ** 2 +
+                self.W_PITCH * pitch ** 2)
+        self._costs.append(cost)
+
+    def end_trial(self) -> dict:
+        """
+        Finalize the current trial.  Returns a result dict and appends
+        it to self.trial_results.
+
+        Returns
+        -------
+        dict with keys: J, survived, duration_s, fell, fall_time_s
+        """
+        duration = (time.time() - self._start_time) if self._start_time else 0.0
+        survived = (not self._fell) and (duration >= self.trial_duration)
+
+        J = float(np.mean(self._costs)) if self._costs else float("inf")
+
+        result = dict(
+            J            = round(J, 6),
+            survived     = survived,
+            duration_s   = round(duration, 2),
+            fell         = self._fell,
+            fall_time_s  = round(self._fall_time, 2) if self._fall_time else None,
+            n_steps      = len(self._costs),
+        )
+        self.trial_results.append(result)
+
+        status = "SURVIVED ✓" if survived else ("FELL ✗" if self._fell else "TIMEOUT ✗")
+        print(f"[Metrics] Trial {len(self.trial_results)} ended  |  "
+              f"J={J:.4f}  |  {status}  |  {duration:.1f}s")
+        return result
+
+    def survival_rate(self) -> float:
+        """S = fraction of completed trials that survived."""
+        if not self.trial_results:
+            return 0.0
+        return sum(1 for r in self.trial_results if r["survived"]) / len(self.trial_results)
+
+    def mean_J(self) -> float:
+        """mean stability cost across completed trials."""
+        vals = [r["J"] for r in self.trial_results if r["J"] != float("inf")]
+        return float(np.mean(vals)) if vals else float("inf")
+
+    def std_J(self) -> float:
+        """Std dev of stability cost."""
+        vals = [r["J"] for r in self.trial_results if r["J"] != float("inf")]
+        return float(np.std(vals)) if len(vals) > 1 else 0.0
+
+    def summary(self) -> str:
+        n  = len(self.trial_results)
+        ns = sum(1 for r in self.trial_results if r["survived"])
+        return (
+            f"\n{'='*50}\n"
+            f"  METRICS SUMMARY  ({n} trials)\n"
+            f"{'='*50}\n"
+            f"  Survival rate  S = {self.survival_rate():.2f}  ({ns}/{n})\n"
+            f"  Stability cost J = {self.mean_J():.4f} ± {self.std_J():.4f}\n"
+            f"{'='*50}\n"
+        )
+
+    def save_csv(self, filepath: str = "metrics_results.csv"):
+        """Save all trial results to a CSV file."""
+        if not self.trial_results:
+            print("[Metrics] No results to save.")
+            return
+        fieldnames = list(self.trial_results[0].keys())
+        with open(filepath, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["trial"] + fieldnames)
+            writer.writeheader()
+            for i, row in enumerate(self.trial_results, start=1):
+                writer.writerow({"trial": i, **row})
+        print(f"[Metrics] Saved {len(self.trial_results)} trials → {filepath}")
