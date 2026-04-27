@@ -1,9 +1,6 @@
 """
-run_experiment.py
-=================
-Experiment runner for the fault-tolerant three-legged locomotion project.
 
-Bridges ThreeLegGaitController <-> Mendbayar's Lab 3 ROS 2 stack.
+Experiment runner for the fault-tolerant three-legged locomotion project.
 
 Lab 3 architecture (lab_3.py):
   - SUBSCRIBES /joint_states                          (sensor_msgs/JointState)
@@ -17,7 +14,7 @@ This file:
     loop stays a simple synchronous 50 Hz loop.
   - Optionally subscribes to /imu/data and /odom for state feedback.  If
     neither is available we estimate body_height proprioceptively and
-    leave roll/pitch = 0  (you'll get a warning at startup).
+    leave roll/pitch = 0  ( a warning at start).
 
 Three conditions (per proposal sec.IV):
   (a) baseline_4leg  - normal 4-leg trot, no fault
@@ -63,6 +60,7 @@ JOINT_NAMES = [
     "leg_back_l_1",  "leg_back_l_2",  "leg_back_l_3",
 ]
 
+# fk
 
 def _rx(a):  return np.array([[1,0,0,0],[0,np.cos(a),-np.sin(a),0],[0,np.sin(a),np.cos(a),0],[0,0,0,1]])
 def _ry(a):  return np.array([[np.cos(a),0,np.sin(a),0],[0,1,0,0],[-np.sin(a),0,np.cos(a),0],[0,0,0,1]])
@@ -111,11 +109,17 @@ def _ik_single_leg(target_ee, leg_index, x0):
         x0=np.asarray(x0, dtype=float),
         method="L-BFGS-B",
         bounds=[(-np.pi, np.pi)] * 3,
-        # Lower maxiter than Lab 3 cache (500) - warm-start converges fast
-        options={"ftol": 1e-9, "gtol": 1e-7, "maxiter": 60},
+        # Lower maxiter than Lab 3 cache (500) - warm-start converges fast.
+        # Pi is CPU-limited; 20 iters is enough with good warm-start and keeps
+        # the control loop near 50 Hz wall-clock instead of slow-motion.
+        options={"ftol": 1e-8, "gtol": 1e-6, "maxiter": 20},
     )
     return res.x
 
+
+# ===========================================================================
+# Lab3Bridge - ROS 2 node implementing the wrapper functions below
+# ===========================================================================
 
 def _import_ros2():
     """Lazy import so smoke mode works without ROS 2 installed."""
@@ -355,6 +359,7 @@ def robot_stop(robot):
         rclpy.shutdown()
     _BRIDGE_STATE.update(node=None, executor=None, thread=None, rclpy=None)
 
+
 def run_trial(mode, disabled_leg_name, velocity=0.20,
               trial_duration=10.0, disable_at_t=3.0):
     disabled_leg = LEG_MAP[disabled_leg_name.upper()]
@@ -468,9 +473,6 @@ def _save_summary_csv(results, path="experiment_summary.csv"):
         for r in results:
             writer.writerow(r)
     print(f"[Results] Summary saved -> {path}")
-
-
-# CLI
 
 
 if __name__ == "__main__":
